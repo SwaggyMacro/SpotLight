@@ -15,6 +15,9 @@ SpotLight is a lightweight VSTO add-in for Microsoft Excel that adds WPS-style a
 2. In the **Selection Highlight** group, turn **Highlight Row and Column** on or off.
 3. Select a highlight color from **Color**.
 
+## ScreenRecord
+https://github.com/user-attachments/assets/31e8f27b-cef3-42fd-8a92-d7b34fb2300c
+
 ## Installation
 
 1. Close all Excel windows.
