@@ -192,7 +192,7 @@ jobs:
               '/v:minimal',
               '/p:Configuration=Release',
               '/p:Platform=AnyCPU',
-              '/p:DefineConstants=VSTO40;USEOFFICEINTEROP',
+              '/p:DefineConstants=VSTO40%3BUSEOFFICEINTEROP',
               "/p:OfficeInteropPath=$env:OFFICE_INTEROP_PATH",
               "/p:OfficeToolsUtilitiesPath=$env:OFFICE_TOOLS_UTILITIES_PATH",
               "/p:Version=$env:SPOTLIGHT_VERSION",
