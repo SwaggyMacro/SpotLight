@@ -8,11 +8,15 @@ SpotLight 是一款为 Microsoft Excel 提供 WPS 风格选中单元格行列高
 
 - 自动高亮当前选中单元格所在的行和列。
 - 在 Excel 的“视图”选项卡中开启或关闭高亮。
+
 ## 使用方法
 
 1. 打开 Excel 的“视图”选项卡。
 2. 在“选区高亮”组中勾选或取消勾选“高亮行列”。
 3. 点击“颜色”选择高亮颜色。
+
+## 效果视频
+https://github.com/user-attachments/assets/31e8f27b-cef3-42fd-8a92-d7b34fb2300c
 
 ## 安装
 
