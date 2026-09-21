@@ -1,0 +1,262 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate tag and project version
+        shell: pwsh
+        run: |
+          [xml]$project = Get-Content -Raw -LiteralPath .\SpotLight.csproj
+          $namespace = New-Object System.Xml.XmlNamespaceManager($project.NameTable)
+          $namespace.AddNamespace('msb', 'http://schemas.microsoft.com/developer/msbuild/2003')
+          $versionNode = $project.SelectSingleNode('//msb:PropertyGroup/msb:Version', $namespace)
+          if ($null -eq $versionNode -or [string]::IsNullOrWhiteSpace($versionNode.InnerText)) {
+              throw 'SpotLight.csproj does not contain a Version property.'
+          }
+
+          $version = $versionNode.InnerText.Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+              throw "Project version '$version' must contain four numeric components."
+          }
+
+          $tag = '${{ github.ref_name }}'
+          $tagVersion = if ($tag.StartsWith('v', [StringComparison]::OrdinalIgnoreCase)) {
+              $tag.Substring(1)
+          }
+          else {
+              $tag
+          }
+
+          if ($tagVersion -ne $version) {
+              throw "Tag '$tag' does not match SpotLight.csproj version '$version'."
+          }
+
+          "SPOTLIGHT_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Ensure Visual Studio Office build tools
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $visualStudioPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if ([string]::IsNullOrWhiteSpace($visualStudioPath)) {
+              throw 'Visual Studio was not found on the runner.'
+          }
+
+          $officeTargets = Join-Path $visualStudioPath 'MSBuild\Microsoft\VisualStudio\v17.0\OfficeTools\Microsoft.VisualStudio.Tools.Office.targets'
+          if (-not (Test-Path -LiteralPath $officeTargets -PathType Leaf)) {
+              $visualStudioSetup = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\setup.exe'
+              & $visualStudioSetup modify `
+                  --installPath $visualStudioPath `
+                  --add Microsoft.VisualStudio.Workload.Office `
+                  --includeRecommended `
+                  --quiet `
+                  --norestart `
+                  --wait
+              if ($LASTEXITCODE -notin @(0, 3010)) {
+                  throw "Installing the Office development workload failed with exit code $LASTEXITCODE."
+              }
+          }
+
+          if (-not (Test-Path -LiteralPath $officeTargets -PathType Leaf)) {
+              throw 'Microsoft.VisualStudio.Tools.Office.targets is unavailable after workload installation.'
+          }
+
+          $officeInteropDirectory = Get-ChildItem -LiteralPath $visualStudioPath -Filter Microsoft.Office.Interop.Excel.dll -Recurse -File |
+              Where-Object { Test-Path -LiteralPath (Join-Path $_.DirectoryName 'Office.dll') } |
+              Select-Object -ExpandProperty DirectoryName -First 1
+          if ([string]::IsNullOrWhiteSpace($officeInteropDirectory)) {
+              throw 'Office and Excel PIA reference assemblies were not found after workload installation.'
+          }
+
+          $officeToolsUtilities = Get-ChildItem -LiteralPath $visualStudioPath -Filter Microsoft.Office.Tools.Common.v4.0.Utilities.dll -Recurse -File |
+              Select-Object -ExpandProperty FullName -First 1
+          if ([string]::IsNullOrWhiteSpace($officeToolsUtilities)) {
+              throw 'Microsoft.Office.Tools.Common.v4.0.Utilities.dll was not found after workload installation.'
+          }
+
+          "OFFICE_INTEROP_PATH=$officeInteropDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OFFICE_TOOLS_UTILITIES_PATH=$officeToolsUtilities" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: "[17.0,18.0)"
+
+      - name: Import VSTO signing certificate
+        shell: pwsh
+        env:
+          VSTO_PFX_BASE64: ${{ secrets.VSTO_PFX_BASE64 }}
+          VSTO_PFX_PASSWORD: ${{ secrets.VSTO_PFX_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:VSTO_PFX_BASE64)) {
+              throw 'Repository secret VSTO_PFX_BASE64 is required.'
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'SpotLight-signing.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:VSTO_PFX_BASE64))
+          $securePassword = if ([string]::IsNullOrEmpty($env:VSTO_PFX_PASSWORD)) {
+              New-Object Security.SecureString
+          }
+          else {
+              ConvertTo-SecureString $env:VSTO_PFX_PASSWORD -AsPlainText -Force
+          }
+
+          $certificate = Import-PfxCertificate `
+              -FilePath $pfxPath `
+              -CertStoreLocation Cert:\CurrentUser\My `
+              -Password $securePassword
+          if ($null -eq $certificate) {
+              throw 'The VSTO signing certificate could not be imported.'
+          }
+
+          "VSTO_CERT_THUMBPRINT=$($certificate.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VSTO_PFX_PATH=$pfxPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build and publish VSTO add-in
+        shell: pwsh
+        run: |
+          $publishDirectory = Join-Path $env:RUNNER_TEMP 'SpotLight-publish'
+          $arguments = @(
+              '.\SpotLight.csproj',
+              '/t:Publish',
+              '/m',
+              '/v:minimal',
+              '/p:Configuration=Release',
+              '/p:Platform=AnyCPU',
+              '/p:DefineConstants=VSTO40;USEOFFICEINTEROP',
+              "/p:OfficeInteropPath=$env:OFFICE_INTEROP_PATH",
+              "/p:OfficeToolsUtilitiesPath=$env:OFFICE_TOOLS_UTILITIES_PATH",
+              "/p:Version=$env:SPOTLIGHT_VERSION",
+              "/p:ApplicationVersion=$env:SPOTLIGHT_VERSION",
+              "/p:PublishUrl=$publishDirectory\",
+              "/p:PublishDir=$publishDirectory\",
+              '/p:ManifestKeyFile=',
+              "/p:ManifestCertificateThumbprint=$env:VSTO_CERT_THUMBPRINT",
+              '/p:SignManifests=true'
+          )
+          & msbuild $arguments
+          if ($LASTEXITCODE -ne 0) {
+              throw "VSTO publish failed with exit code $LASTEXITCODE."
+          }
+
+          $assembly = [Reflection.AssemblyName]::GetAssemblyName((Resolve-Path '.\bin\Release\SpotLight.dll'))
+          if ($assembly.Version.ToString() -ne $env:SPOTLIGHT_VERSION) {
+              throw "Built assembly version '$($assembly.Version)' does not match '$env:SPOTLIGHT_VERSION'."
+          }
+
+          $deploymentManifest = Get-ChildItem -LiteralPath $publishDirectory -Filter SpotLight.vsto -Recurse -File |
+              Where-Object { Test-Path -LiteralPath (Join-Path $_.DirectoryName 'setup.exe') } |
+              Select-Object -First 1
+          if ($null -eq $deploymentManifest) {
+              throw 'Published SpotLight.vsto and setup.exe were not found.'
+          }
+
+          $publishRoot = $deploymentManifest.DirectoryName
+          [xml]$manifest = Get-Content -Raw -LiteralPath $deploymentManifest.FullName
+          $manifestVersion = $manifest.assembly.assemblyIdentity.version
+          if ($manifestVersion -ne $env:SPOTLIGHT_VERSION) {
+              throw "Published manifest version '$manifestVersion' does not match '$env:SPOTLIGHT_VERSION'."
+          }
+
+          "PUBLISH_ROOT=$publishRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          $releaseDirectory = Join-Path $env:RUNNER_TEMP 'SpotLight-release'
+          New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
+
+          & .\Installer\build-setup.ps1 `
+              -PublishDirectory $env:PUBLISH_ROOT `
+              -OutputDirectory $releaseDirectory
+          if ($LASTEXITCODE -ne 0) {
+              throw 'Building the single-file installer failed.'
+          }
+
+          $installer = Join-Path $releaseDirectory 'SpotLightSetup.exe'
+          $versionedInstaller = Join-Path $releaseDirectory "SpotLight-$env:SPOTLIGHT_VERSION-Setup.exe"
+          Move-Item -LiteralPath $installer -Destination $versionedInstaller -Force
+
+          $signTool = Get-ChildItem -LiteralPath "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse -File |
+              Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+              Sort-Object FullName -Descending |
+              Select-Object -ExpandProperty FullName -First 1
+          if ([string]::IsNullOrWhiteSpace($signTool)) {
+              throw 'signtool.exe was not found on the runner.'
+          }
+
+          & $signTool sign `
+              /sha1 $env:VSTO_CERT_THUMBPRINT `
+              /s My `
+              /fd SHA256 `
+              /tr http://timestamp.digicert.com `
+              /td SHA256 `
+              $versionedInstaller
+          if ($LASTEXITCODE -ne 0) {
+              throw "Signing the single-file installer failed with exit code $LASTEXITCODE."
+          }
+
+          $publishArchive = Join-Path $releaseDirectory "SpotLight-$env:SPOTLIGHT_VERSION-Publish.zip"
+          Compress-Archive -Path (Join-Path $env:PUBLISH_ROOT '*') -DestinationPath $publishArchive -CompressionLevel Optimal
+
+          $checksumPath = Join-Path $releaseDirectory 'SHA256SUMS.txt'
+          Get-FileHash -LiteralPath $versionedInstaller, $publishArchive -Algorithm SHA256 |
+              ForEach-Object { "$($_.Hash) *$([IO.Path]::GetFileName($_.Path))" } |
+              Set-Content -LiteralPath $checksumPath -Encoding ascii
+
+          "RELEASE_DIRECTORY=$releaseDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpotLight-${{ env.SPOTLIGHT_VERSION }}
+          path: ${{ env.RELEASE_DIRECTORY }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $assets = Get-ChildItem -LiteralPath $env:RELEASE_DIRECTORY -File | ForEach-Object { $_.FullName }
+          & gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+              & gh release upload $tag $assets --repo $env:GITHUB_REPOSITORY --clobber
+          }
+          else {
+              & gh release create $tag $assets `
+                  --repo $env:GITHUB_REPOSITORY `
+                  --title "SpotLight $env:SPOTLIGHT_VERSION" `
+                  --generate-notes `
+                  --verify-tag
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Publishing GitHub Release failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Remove signing certificate
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:VSTO_CERT_THUMBPRINT)) {
+              Remove-Item -LiteralPath "Cert:\CurrentUser\My\$env:VSTO_CERT_THUMBPRINT" -Force -ErrorAction SilentlyContinue
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:VSTO_PFX_PATH)) {
+              Remove-Item -LiteralPath $env:VSTO_PFX_PATH -Force -ErrorAction SilentlyContinue
+          }
