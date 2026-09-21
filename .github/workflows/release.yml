@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to build (for example, v1.0.0.1)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -33,7 +39,16 @@ jobs:
               throw "Project version '$version' must contain four numeric components."
           }
 
-          $tag = '${{ github.ref_name }}'
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+              '${{ inputs.release_tag }}'.Trim()
+          }
+          else {
+              '${{ github.ref_name }}'
+          }
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+              throw 'A release tag is required.'
+          }
+
           $tagVersion = if ($tag.StartsWith('v', [StringComparison]::OrdinalIgnoreCase)) {
               $tag.Substring(1)
           }
@@ -46,8 +61,9 @@ jobs:
           }
 
           "SPOTLIGHT_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SPOTLIGHT_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Ensure Visual Studio Office build tools
+      - name: Prepare Visual Studio Office build tools
         shell: pwsh
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -75,11 +91,50 @@ jobs:
               throw 'Microsoft.VisualStudio.Tools.Office.targets is unavailable after workload installation.'
           }
 
-          $officeInteropDirectory = Get-ChildItem -LiteralPath $visualStudioPath -Filter Microsoft.Office.Interop.Excel.dll -Recurse -File |
-              Where-Object { Test-Path -LiteralPath (Join-Path $_.DirectoryName 'Office.dll') } |
-              Select-Object -ExpandProperty DirectoryName -First 1
-          if ([string]::IsNullOrWhiteSpace($officeInteropDirectory)) {
-              throw 'Office and Excel PIA reference assemblies were not found after workload installation.'
+          # The VS Office workload supplies VSTO build targets, but current hosted
+          # runners do not include Office itself or its Primary Interop Assemblies.
+          $officeInteropDirectory = Join-Path $env:RUNNER_TEMP 'office-interop'
+          New-Item -ItemType Directory -Path $officeInteropDirectory -Force | Out-Null
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          function Copy-NuGetAssembly {
+              param(
+                  [Parameter(Mandatory = $true)][string]$PackageId,
+                  [Parameter(Mandatory = $true)][string]$PackageVersion,
+                  [Parameter(Mandatory = $true)][string]$AssemblyPath
+              )
+
+              $normalizedId = $PackageId.ToLowerInvariant()
+              $packageFile = Join-Path $env:RUNNER_TEMP "$normalizedId.$PackageVersion.nupkg"
+              $packageDirectory = Join-Path $env:RUNNER_TEMP "$normalizedId.$PackageVersion"
+              $packageUri = "https://api.nuget.org/v3-flatcontainer/$normalizedId/$PackageVersion/$normalizedId.$PackageVersion.nupkg"
+
+              Invoke-WebRequest -Uri $packageUri -OutFile $packageFile
+              [IO.Compression.ZipFile]::ExtractToDirectory($packageFile, $packageDirectory)
+
+              $source = Join-Path $packageDirectory $AssemblyPath
+              if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                  throw "Assembly '$AssemblyPath' was not found in $PackageId $PackageVersion."
+              }
+
+              Copy-Item -LiteralPath $source -Destination $officeInteropDirectory -Force
+          }
+
+          Copy-NuGetAssembly `
+              -PackageId 'Microsoft.Office.Interop.Excel' `
+              -PackageVersion '16.0.18925.20022' `
+              -AssemblyPath 'lib\net40\Microsoft.Office.Interop.Excel.dll'
+          Copy-NuGetAssembly `
+              -PackageId 'MicrosoftOfficeCore16' `
+              -PackageVersion '16.0.16626.20000' `
+              -AssemblyPath 'lib\net40\office.dll'
+
+          $excelInterop = Join-Path $officeInteropDirectory 'Microsoft.Office.Interop.Excel.dll'
+          $officeInterop = Join-Path $officeInteropDirectory 'office.dll'
+          $excelInteropVersion = [Reflection.AssemblyName]::GetAssemblyName($excelInterop).Version.ToString()
+          $officeInteropVersion = [Reflection.AssemblyName]::GetAssemblyName($officeInterop).Version.ToString()
+          if ($excelInteropVersion -ne '16.0.0.0' -or $officeInteropVersion -ne '16.0.0.0') {
+              throw "Unexpected Office PIA versions: Excel=$excelInteropVersion, Office=$officeInteropVersion."
           }
 
           $officeToolsUtilities = Get-ChildItem -LiteralPath $visualStudioPath -Filter Microsoft.Office.Tools.Common.v4.0.Utilities.dll -Recurse -File |
@@ -232,7 +287,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = '${{ github.ref_name }}'
+          $tag = $env:SPOTLIGHT_TAG
           $assets = Get-ChildItem -LiteralPath $env:RELEASE_DIRECTORY -File | ForEach-Object { $_.FullName }
           & gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {

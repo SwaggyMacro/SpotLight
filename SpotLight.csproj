@@ -164,12 +164,12 @@
   <Choose>
     <When Condition="$([System.String]::Copy(&quot;;$(DefineConstants);&quot;).ToLower().Contains(';useofficeinterop;')) or $([System.String]::Copy(&quot;,$(DefineConstants),&quot;).ToLower().Contains(',useofficeinterop,'))">
       <ItemGroup>
-        <Reference Include="Office, Version=15.0.0.0, Culture=neutral, PublicKeyToken=71e9bce111e9429c">
+        <Reference Include="Office, Version=16.0.0.0, Culture=neutral, PublicKeyToken=71e9bce111e9429c">
           <HintPath Condition="'$(OfficeInteropPath)' != ''">$(OfficeInteropPath)\Office.dll</HintPath>
           <Private>False</Private>
           <EmbedInteropTypes>true</EmbedInteropTypes>
         </Reference>
-        <Reference Include="Microsoft.Office.Interop.Excel, Version=15.0.0.0, Culture=neutral, PublicKeyToken=71e9bce111e9429c">
+        <Reference Include="Microsoft.Office.Interop.Excel, Version=16.0.0.0, Culture=neutral, PublicKeyToken=71e9bce111e9429c">
           <HintPath Condition="'$(OfficeInteropPath)' != ''">$(OfficeInteropPath)\Microsoft.Office.Interop.Excel.dll</HintPath>
           <Private>False</Private>
           <EmbedInteropTypes>true</EmbedInteropTypes>
